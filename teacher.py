@@ -1,97 +1,146 @@
 from multiprocessing import shared_memory
 import time
 import pynvml
+import subprocess
+import sys
 
-# --- НАСТРОЙКИ NVML (Управление ГП) ---
-pynvml.nvmlInit()
-gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-
+# --- НАСТРОЙКИ ---
+exe_path = r"D:\neiron\neiron.exe"
 МИН_ЧАСТОТА = 210
 МАКС_ЧАСТОТА = 3105
-МНОЖИТЕЛЬ = 1.1  # Шаг изменения частоты
+МНОЖИТЕЛЬ = 1.1
 
-def изменить_частоту(увеличить=True):
+def run_neiron():
+    """Запускает EXE и считывает два динамических адреса из терминала"""
     try:
-        # Получаем текущую частоту
-        текущая = pynvml.nvmlDeviceGetClockInfo(gpu_handle, pynvml.NVML_CLOCK_GRAPHICS)
+        процесс = subprocess.Popen(
+            [exe_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8', # Если будут ошибки в тексте, попробуй 'cp866'
+            bufsize=1
+        )
+
+        # Читаем первые две строки — это должны быть имена адресов памяти
+        адрес_входа = процесс.stdout.readline().strip()
+        адрес_выхода = процесс.stdout.readline().strip()
+
+        if адрес_входа and адрес_выхода:
+            print(f"[*] Стримы получены: Вход={адрес_входа}, Выход={адрес_выхода}")
+            return адрес_входа, адрес_выхода, процесс
+        else:
+            print("[!] EXE не предоставил адреса памяти.")
+            return None, None, None
+
+    except Exception as ошибка:
+        print(f"[!] Ошибка запуска EXE: {ошибка}")
+        return None, None, None
+
+def изменить_частоту(хэндл_гп, увеличить=True):
+    """Управляет частотой графического ядра"""
+    try:
+        текущая = pynvml.nvmlDeviceGetClockInfo(хэндл_гп, pynvml.NVML_CLOCK_GRAPHICS)
         
         if увеличить:
             новая = int(текущая * МНОЖИТЕЛЬ)
-            status = "УВЕЛИЧЕНИЕ"
+            статус = "РАЗГОН"
         else:
             новая = int(текущая / МНОЖИТЕЛЬ)
-            status = "СНИЖЕНИЕ"
+            статус = "СБРОС"
         
-        # Проверка границ
+        # Ограничиваем частоту рамками железа
         новая = max(МИН_ЧАСТОТА, min(новая, МАКС_ЧАСТОТА))
         
-        # Фиксация частоты (нужны права админа)
-        pynvml.nvmlDeviceSetGpuLockedClocks(gpu_handle, новая, новая)
-        print(f"[*] ГП: {текущая}MHz -> {новая}MHz ({status})")
+        # Установка частоты (требует прав админа)
+        pynvml.nvmlDeviceSetGpuLockedClocks(хэндл_гп, новая, новая)
+        print(f"[*] ГП: {текущая}MHz -> {новая}MHz ({статус})")
         
     except pynvml.NVMLError as err:
-        print(f"[!] Ошибка NVML: {err} (Запустите от Админа)")
+        print(f"[!] Ошибка NVML (нужен админ): {err}")
 
-# --- НАСТРОЙКА SHARED MEMORY ---
-NAME_INPUT = "shm_input"
-NAME_RESPONSE = "shm_response"
+# --- ОСНОВНАЯ ЛОГИКА ---
 
+# 1. Инициализация NVML
 try:
-    # Подключаемся к памяти сервера
-    shm_in = shared_memory.SharedMemory(name=NAME_INPUT)
-    shm_res = shared_memory.SharedMemory(name=NAME_RESPONSE)
+    pynvml.nvmlInit()
+    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+except Exception as e:
+    print(f"[!] Не удалось инициализировать NVML: {e}")
+    sys.exit()
+
+# 2. Запуск нейронки и получение адресов
+адрес_отправки, адрес_чтения, neiron_proc = run_neiron()
+
+if not адрес_отправки or not адрес_чтения:
+    print("[!] Работа невозможна без адресов. Выход.")
+    pynvml.nvmlShutdown()
+    sys.exit()
+
+# 3. Подключение к SharedMemory и основной цикл
+try:
+    shm_in = shared_memory.SharedMemory(name=адрес_отправки)
+    shm_res = shared_memory.SharedMemory(name=адрес_чтения)
     
-    print("[*] КЛИЕНТ: Связь с ОЗУ и ГП установлена.")
-    print(f"[*] Лимиты: {МИН_ЧАСТОТА}-{МАКС_ЧАСТОТА} MHz")
+    print("\n[*] Связь с ОЗУ установлена. Система готова.")
+    print(f"[*] Диапазон: {МИН_ЧАСТОТА}-{МАКС_ЧАСТОТА} MHz")
 
     while True:
-        msg = input("\nВведите данные (0-255) или 'exit': ")
-        if msg.lower() == 'exit': 
+        команда = input("\nВвод (0-255) или 'exit': ").strip()
+        
+        if команда.lower() == 'exit':
             break
             
         try:
-            val_to_send = int(msg)
-            if 0 <= val_to_send <= 255:
-                # 1. Запоминаем старый ответ
-                old_response = shm_res.buf[0]
+            значение = int(команда)
+            if 0 <= значение <= 255:
+                # Запоминаем текущий ответ для отслеживания изменений
+                старый_ответ = shm_res.buf[0]
                 
-                # 2. Пишем в память "вход"
-                shm_in.buf[0] = val_to_send
-                print(f"[>] Отправлено в ОЗУ: {val_to_send}. Ждем расчет...")
+                # Пишем данные для EXE
+                shm_in.buf[0] = значение
+                print(f"[>] Отправлено: {значение}. Ждем ответ...")
                 
-                # 3. Ждем, пока сервер обновит "ответ" (цикл мониторинга)
-                timeout = 0
-                while shm_res.buf[0] == old_response and timeout < 30:
+                # Ожидание реакции (таймаут 1.5 сек)
+                таймер = 0
+                while shm_res.buf[0] == старый_ответ and таймер < 30:
                     time.sleep(0.05)
-                    timeout += 1
+                    таймер += 1
                 
-                res_val = shm_res.buf[0]
-                print(f"[<] Получен ответ из ОЗУ: {res_val}")
+                ответ_exe = shm_res.buf[0]
+                print(f"[<] Ответ нейронки: {ответ_exe}")
 
-                # 4. ЛОГИКА УПРАВЛЕНИЯ ЧАСТОТОЙ
-                # Если ответ шейдера совпал с тем, что мы ввели — повышаем частоту
-                if res_val == val_to_send:
-                    print("[+] СОВПАДЕНИЕ! Нейросеть в ОЗУ подтвердила данные.")
-                    изменить_частоту(увеличить=True)
+                # Логика управления частотой
+                if ответ_exe == значение:
+                    print("[+] Совпадение! Повышаем частоту.")
+                    изменить_частоту(gpu_handle, увеличить=True)
                 else:
-                    print("[-] ОШИБКА! Данные в адресах не совпали.")
-                    изменить_частоту(увеличить=False)
-                    
+                    print("[-] Неверно. Снижаем частоту.")
+                    изменить_частоту(gpu_handle, увеличить=False)
             else:
-                print("[-] Введите число от 0 до 255")
+                print("[-] Введи число от 0 до 255.")
         except ValueError:
-            print("[-] Нужна цифра")
+            print("[-] Нужна цифра.")
 
-except FileNotFoundError:
-    print("[!] Ошибка: Сервер (GPU_Server) не найден в ОЗУ!")
+except Exception as e:
+    print(f"[!] Критическая ошибка: {e}")
+
 finally:
-    # Сброс настроек ГП и закрытие памяти
+    # Очистка ресурсов при выходе
+    print("\n[*] Завершение работы...")
+    
     try:
         pynvml.nvmlDeviceResetGpuLockedClocks(gpu_handle)
-        print("[*] Частоты ГП сброшены в авто-режим.")
+        print("[*] Частоты ГП возвращены в авто-режим.")
     except:
         pass
     
     if 'shm_in' in locals(): shm_in.close()
     if 'shm_res' in locals(): shm_res.close()
+    
+    if neiron_proc:
+        neiron_proc.terminate() # Закрываем EXE
+        print("[*] EXE процесс завершен.")
+        
     pynvml.nvmlShutdown()
+    print("[*] NVML выключен. Пока.")
